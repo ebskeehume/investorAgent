@@ -76,6 +76,20 @@ class KLSELedgerEngine:
                     "INSERT INTO account VALUES (1, ?, ?, ?)",
                     (self.initial_capital, self.initial_capital, now)
                 )
+
+            # --- 自动向后兼容数据库迁移 (Schema Migration) ---
+            cur.execute("PRAGMA table_info(trades)")
+            trade_cols = [c[1] for c in cur.fetchall()]
+            if "confidence" not in trade_cols:
+                cur.execute("ALTER TABLE trades ADD COLUMN confidence REAL DEFAULT 0.0")
+
+            cur.execute("PRAGMA table_info(nav_history)")
+            nav_cols = [c[1] for c in cur.fetchall()]
+            if "benchmark_price" not in nav_cols:
+                cur.execute("ALTER TABLE nav_history ADD COLUMN benchmark_price REAL")
+            if "benchmark_return_pct" not in nav_cols:
+                cur.execute("ALTER TABLE nav_history ADD COLUMN benchmark_return_pct REAL")
+
             conn.commit()
 
     def get_account_summary(self, price_map: Optional[Dict[str, float]] = None) -> Dict:
