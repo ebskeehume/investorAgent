@@ -270,7 +270,10 @@ def run_agent_trading():
     print("错误: 请先安装 google-genai 依赖 (pip install google-genai)")
     return
 
-  model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+  preferred_model = os.environ.get("GEMINI_MODEL")
+  candidate_models = [m for m in [preferred_model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"] if m]
+  seen = set()
+  candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
   watchlist = ["1155", "1295", "5347", "1023", "5225"]
   engine = KLSELedgerEngine(db_path="klse_paper_trade.db", initial_capital=100000.0)
   
@@ -303,15 +306,23 @@ def run_agent_trading():
   """
 
   client = genai.Client(api_key=api_key)
-  try:
-    response = client.models.generate_content(
-        model=model_name,
-        contents=system_prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
-    )
-  except Exception as e:
-    print(f"Gemini API 调用异常: {e}")
-    return
+  response = None
+  for m in candidate_models:
+    try:
+      response = client.models.generate_content(
+          model=m,
+          contents=system_prompt,
+          config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
+      )
+      print(f"成功使用模型: {m}")
+      break
+    except Exception as e:
+      print(f"模型 {m} 调用异常: {e}")
+
+  if not response or not response.text:
+    print("所有候选模型调用均失败，无法获取 AI 决策输出。")
+    import sys
+    sys.exit(1)
 
   print("AI 今日决策输出：\n", response.text)
 
