@@ -1,436 +1,62 @@
-请作为全栈 DevOps 工程师，帮我自动化初始化并部署一个马股（KLSE）虚拟交易 AI Agent 项目。
+# 马来西亚股票市场（KLSE）虚拟投资 AI Agent 架构规范
 
-### 目标架构
-1. 本地目录初始化，生成环境依赖配置文件。
-2. 创建完整的交易与撮合脚本 `main.py`（包含 KLSE 规费逻辑、数据抓取、SQLite 模拟账本和 Gemini Flash 决策）。
-3. 配置 GitHub Actions 定时工作流，每周一至周五马股盘后（17:30 GMT+8 / 09:30 UTC）自动运行并将数据库变更回写。
+本项目为专注于马来西亚吉隆坡证券交易所（Bursa Malaysia / KLSE）的虚拟投资 AI Agent，整体架构解耦为**数据获取、分析决策、模拟记账、复盘归因**四个核心模块。
 
 ---
 
-### 执行步骤
+### 一、 系统整体架构与技术选型
 
-#### 步骤 1：创建项目工作目录与依赖文件
-在当前目录下创建项目所需文件，并在其中生成 `requirements.txt`：
-- `yfinance>=0.2.36`
-- `pandas>=2.0.0`
-- `google-genai>=0.1.1`
+| 模块 | 功能 | 推荐工具 / 数据源 |
+| --- | --- | --- |
+| **Orchestrator** | 协调工作流与定时调度 | GitHub Actions / 本地 Python 调度器 (`main.py`) |
+| **LLM Core** | 行业与基本面分析、决策生成 | Google Gemini（默认支持 `gemini-flash-lite-latest` / `gemini-3.6-flash`，带 503 指数退避重试与模型自愈探测） |
+| **KLSE 数据源** | 股价、成交量、大宗商品、宏观基准 | Yahoo Finance (`.KL` 后缀，如 `1155.KL`，原油 `BZ=F`，基准 `^KLSE`) |
+| **Ledger 账本** | 现金与持仓状态、真实规费撮合 | SQLite + Pandas 计算每日资产净值 (NAV) |
+| **Analytics 归因** | 绩效评估、超额收益 (Alpha)、夏普比率、最大回撤 | Python NumPy/Pandas 归因计算器 (`investor_agent.analytics`) |
 
-#### 步骤 2：生成核心代码文件 `main.py`
-在项目根目录写入以下完整代码：
+---
+
+### 二、 投资准则与风控配置字典 (`investor_agent/config.py`)
 
 ```python
-import datetime
-import json
-import math
-import os
-import sqlite3
-import time
-from typing import Dict, List, Optional
-import pandas as pd
-import yfinance as yf
-
-# 1. KLSE 费用计算器
-class KLSEFeeCalculator:
-  @staticmethod
-  def calculate_fees(contract_value: float) -> Dict[str, float]:
-    if contract_value <= 0:
-      return {
-          "brokerage": 0.0,
-          "sst": 0.0,
-          "clearing_fee": 0.0,
-          "stamp_duty": 0.0,
-          "total_fee": 0.0,
-      }
-    # 最低 RM 8.00 或 0.08%
-    brokerage = max(8.00, contract_value * 0.0008)
-    # 经纪佣金服务税 8% SST
-    sst = brokerage * 0.08
-    # 结算费 0.03%（最高 RM 1000.00）
-    clearing_fee = min(1000.00, contract_value * 0.0003)
-    # 印花税：每 RM 1000 计 RM 1.50（最高 RM 1000.00）
-    stamp_duty = min(1000.00, math.ceil(contract_value / 1000.00) * 1.50)
-    total_fee = brokerage + sst + clearing_fee + stamp_duty
-    return {
-        "brokerage": round(brokerage, 2),
-        "sst": round(sst, 2),
-        "clearing_fee": round(clearing_fee, 2),
-        "stamp_duty": round(stamp_duty, 2),
-        "total_fee": round(total_fee, 2),
-    }
-
-# 2. 行情抓取
-class KLSEMarketData:
-  @staticmethod
-  def format_ticker(code: str) -> str:
-    code = code.strip().upper()
-    return code if code.endswith(".KL") else f"{code}.KL"
-
-  @classmethod
-  def get_batch_market_data(cls, codes: List[str]) -> Dict[str, Dict]:
-    if not codes:
-      return {}
-    formatted = [cls.format_ticker(c) for c in codes]
-    try:
-      data = yf.download(formatted, period="1mo", interval="1d", group_by="ticker", progress=False)
-    except Exception as e:
-      print(f"行情下载异常: {e}")
-      return {}
-
-    results = {}
-    is_multi = isinstance(data.columns, pd.MultiIndex)
-
-    for code in codes:
-      t = cls.format_ticker(code)
-      try:
-        if is_multi:
-          if t not in data.columns.levels[0]:
-            continue
-          sub_df = data[t].dropna(subset=["Close"])
-        else:
-          sub_df = data.dropna(subset=["Close"])
-
-        if len(sub_df) < 5:
-          continue
-
-        close_series = sub_df["Close"]
-        latest_close = float(close_series.iloc[-1])
-        sma20 = float(close_series.rolling(20).mean().iloc[-1]) if len(close_series) >= 20 else latest_close
-        change_5d = float((latest_close - close_series.iloc[-5]) / close_series.iloc[-5]) * 100
-        vol = sub_df["Volume"].iloc[-1] if "Volume" in sub_df.columns else 0
-        volume = int(vol) if not pd.isna(vol) else 0
-
-        results[code] = {
-            "price": round(latest_close, 3),
-            "sma20": round(sma20, 3),
-            "change_5d_pct": round(change_5d, 2),
-            "volume": volume,
-        }
-      except Exception as e:
-        print(f"处理股票 {code} 行情异常: {e}")
-        continue
-    return results
-
-# 3. 模拟账本
-class KLSELedgerEngine:
-  def __init__(self, db_path: str = "klse_paper_trade.db", initial_capital: float = 100000.00):
-    self.db_path = db_path
-    self.initial_capital = initial_capital
-    self._init_db()
-
-  def _get_conn(self) -> sqlite3.Connection:
-    return sqlite3.connect(self.db_path)
-
-  def _init_db(self):
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS account (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            cash REAL NOT NULL,
-            initial_capital REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            ticker TEXT PRIMARY KEY,
-            shares INTEGER NOT NULL,
-            avg_cost REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            action TEXT NOT NULL,
-            lots INTEGER NOT NULL,
-            shares INTEGER NOT NULL,
-            price REAL NOT NULL,
-            contract_val REAL NOT NULL,
-            total_fees REAL NOT NULL,
-            net_amount REAL NOT NULL,
-            reason TEXT
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS nav_history (
-            date TEXT PRIMARY KEY,
-            cash REAL NOT NULL,
-            portfolio_value REAL NOT NULL,
-            total_equity REAL NOT NULL,
-            daily_return_pct REAL NOT NULL
-        )
-      """)
-      cur.execute("SELECT COUNT(*) FROM account")
-      if cur.fetchone()[0] == 0:
-        now = datetime.datetime.now().isoformat()
-        cur.execute("INSERT INTO account VALUES (1, ?, ?, ?)", (self.initial_capital, self.initial_capital, now))
-      conn.commit()
-
-  def get_account_summary(self) -> Dict:
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash, initial_capital FROM account WHERE id = 1")
-      cash, initial = cur.fetchone()
-      positions = pd.read_sql_query("SELECT * FROM positions", conn)
-      return {
-          "cash": cash,
-          "initial_capital": initial,
-          "positions": positions.to_dict(orient="records"),
-      }
-
-  def execute_order(self, ticker: str, action: str, lots: int, price: float, reason: str = "") -> Dict:
-    action = action.upper()
-    if action not in ["BUY", "SELL"] or lots <= 0 or price <= 0:
-      return {"success": False, "msg": "无效参数"}
-    shares = lots * 100
-    contract_val = shares * price
-    fees = KLSEFeeCalculator.calculate_fees(contract_val)
-    now_str = datetime.date.today().isoformat()
-
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash FROM account WHERE id = 1")
-      cash = cur.fetchone()[0]
-
-      if action == "BUY":
-        total_required = contract_val + fees["total_fee"]
-        if cash < total_required:
-          return {"success": False, "msg": f"资金不足，需 RM {total_required:.2f}，当前可用 RM {cash:.2f}"}
-        new_cash = cash - total_required
-        cur.execute("UPDATE account SET cash = ?, updated_at = ? WHERE id = 1", (new_cash, now_str))
-        cur.execute("SELECT shares, avg_cost FROM positions WHERE ticker = ?", (ticker,))
-        row = cur.fetchone()
-        if row:
-          new_shares = row[0] + shares
-          new_cost = ((row[0] * row[1]) + total_required) / new_shares
-          cur.execute("UPDATE positions SET shares = ?, avg_cost = ?, updated_at = ? WHERE ticker = ?", (new_shares, new_cost, now_str, ticker))
-        else:
-          cur.execute("INSERT INTO positions VALUES (?, ?, ?, ?)", (ticker, shares, total_required / shares, now_str))
-        net_amount = -total_required
-
-      elif action == "SELL":
-        cur.execute("SELECT shares, avg_cost FROM positions WHERE ticker = ?", (ticker,))
-        row = cur.fetchone()
-        if not row or row[0] < shares:
-          return {"success": False, "msg": f"持仓不足，当前持仓 {row[0] if row else 0} 股"}
-        proceeds = contract_val - fees["total_fee"]
-        new_cash = cash + proceeds
-        cur.execute("UPDATE account SET cash = ?, updated_at = ? WHERE id = 1", (new_cash, now_str))
-        remaining = row[0] - shares
-        if remaining == 0:
-          cur.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
-        else:
-          cur.execute("UPDATE positions SET shares = ?, updated_at = ? WHERE ticker = ?", (remaining, now_str, ticker))
-        net_amount = proceeds
-
-      cur.execute("""
-        INSERT INTO trades (date, ticker, action, lots, shares, price, contract_val, total_fees, net_amount, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      """, (now_str, ticker, action, lots, shares, price, contract_val, fees["total_fee"], net_amount, reason))
-      conn.commit()
-
-    return {"success": True, "ticker": ticker, "action": action, "lots": lots}
-
-  def record_daily_snapshot(self, price_map: Dict[str, float]) -> Dict:
-    now_str = datetime.date.today().isoformat()
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash FROM account WHERE id = 1")
-      cash = cur.fetchone()[0]
-      positions = pd.read_sql_query("SELECT * FROM positions", conn)
-      portfolio_val = sum(row["shares"] * price_map.get(row["ticker"], row["avg_cost"]) for _, row in positions.iterrows()) if not positions.empty else 0.0
-      total_equity = cash + portfolio_val
-
-      cur.execute("SELECT total_equity FROM nav_history ORDER BY date DESC LIMIT 1")
-      prev = cur.fetchone()
-      prev_equity = prev[0] if prev else self.initial_capital
-      daily_return = (((total_equity - prev_equity) / prev_equity) * 100) if prev_equity > 0 else 0.0
-
-      cur.execute("""
-        INSERT OR REPLACE INTO nav_history (date, cash, portfolio_value, total_equity, daily_return_pct)
-        VALUES (?, ?, ?, ?, ?)
-      """, (now_str, round(cash, 2), round(portfolio_val, 2), round(total_equity, 2), round(daily_return, 4)))
-      conn.commit()
-      return {"total_equity": round(total_equity, 2), "cash": round(cash, 2), "daily_return": round(daily_return, 2)}
-
-# 4. Agent 决策入口
-def run_agent_trading():
-  api_key = os.environ.get("GEMINI_API_KEY")
-  if not api_key:
-    import sys
-    print("错误: 未配置 GEMINI_API_KEY 环境变量！请在 GitHub 仓库 Settings -> Secrets 中配置 GEMINI_API_KEY。")
-    sys.exit(1)
-
-  try:
-    from google import genai
-    from google.genai import types
-  except ImportError:
-    print("错误: 请先安装 google-genai 依赖 (pip install google-genai)")
-    return
-
-  preferred_model = os.environ.get("GEMINI_MODEL")
-  candidate_models = [m for m in [preferred_model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"] if m]
-  seen = set()
-  candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
-  watchlist = ["1155", "1295", "5347", "1023", "5225"]
-  engine = KLSELedgerEngine(db_path="klse_paper_trade.db", initial_capital=100000.0)
-  
-  market_data = KLSEMarketData.get_batch_market_data(watchlist)
-  if not market_data:
-    print("今日未能获取有效行情数据（可能为公假、周末或网络故障），跳过 AI 决策执行。")
-    return
-
-  account_info = engine.get_account_summary()
-
-  system_prompt = f"""
-    你是一名专注马来西亚吉隆坡证券交易所（KLSE）的理智量化与价值投资分析师。
-    当前账户资金状态：
-    - 可用现金：RM {account_info['cash']:.2f}
-    - 当前持仓：{json.dumps(account_info['positions'], ensure_ascii=False)}
-
-    今日市场行情快照：
-    {json.dumps(market_data, ensure_ascii=False)}
-
-    【投资与风控规则】：
-    1. 每次交易单位必须为 1 Lot = 100 股。
-    2. 单只股票总持仓不得超过总资产的 25%。现金储备必须保留不少于 10%。
-    3. 如果没有明显胜率，保持持有（HOLD），不用每天都交易。
-    4. 严格输出合规的 JSON 数组，严禁附带额外文字。
-    格式示例：
-    [
-      {{"ticker": "1155", "action": "BUY", "lots": 5, "reason": "突破20日均线且估值具备吸引力"}},
-      {{"ticker": "5347", "action": "HOLD", "lots": 0, "reason": "短期震荡，维持观望"}}
-    ]
-  """
-
-  client = genai.Client(api_key=api_key)
-  response = None
-  for m in candidate_models:
-    for attempt in range(3):
-      try:
-        response = client.models.generate_content(
-            model=m,
-            contents=system_prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
-        )
-        print(f"成功使用模型: {m}")
-        break
-      except Exception as e:
-        err_msg = str(e)
-        if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-          wait_sec = (attempt + 1) * 3
-          print(f"模型 {m} 临时繁忙，等待 {wait_sec} 秒后重试 (第 {attempt + 1}/3 次)...")
-          time.sleep(wait_sec)
-          continue
-        print(f"模型 {m} 调用异常: {e}")
-        break
-    if response and response.text:
-      break
-
-  if not response or not response.text:
-    print("所有候选模型调用均失败，无法获取 AI 决策输出。")
-    import sys
-    sys.exit(1)
-
-  print("AI 今日决策输出：\n", response.text)
-
-  raw_text = response.text.strip()
-  if raw_text.startswith("```"):
-    raw_text = raw_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-  try:
-    decisions = json.loads(raw_text)
-  except json.JSONDecodeError as e:
-    print(f"解析 AI 决策 JSON 失败: {e}\n原始内容: {response.text}")
-    return
-
-  for dec in decisions:
-    action = dec.get("action", "").upper()
-    ticker = str(dec.get("ticker", ""))
-    lots = int(dec.get("lots", 0))
-    reason = dec.get("reason", "")
-    if action in ["BUY", "SELL"] and lots > 0 and ticker in market_data:
-      price = market_data[ticker]["price"]
-      result = engine.execute_order(ticker, action, lots, price, reason)
-      print(f"执行订单结果 [{ticker}]:", result)
-
-  price_map = {k: v["price"] for k, v in market_data.items()}
-  summary = engine.record_daily_snapshot(price_map)
-  print("\n今日资产清算完毕：", summary)
-
-if __name__ == "__main__":
-  run_agent_trading()
+CONFIG = {
+    "initial_capital_myr": 100000.00,  # 初始虚拟本金 RM 100,000
+    "max_position_weight": 0.20,       # 单股最大权重 20% (RM 20,000)
+    "min_cash_reserve": 0.10,          # 永远保留 10% 现金应对波动
+    "lot_size": 100,                   # 马股强制 100 股整数倍
+    "stop_loss_pct": 0.07,             # 7% 硬止损
+    "take_profit_pct": 0.15,           # 15% 目标止盈
+    "brokerage_rate": 0.0008,          # 佣金 0.08% (最低 RM 8.00)
+    "sst_rate": 0.08,                  # 佣金服务税 8% SST
+    "clearing_fee_rate": 0.0003,       # 结算费 0.03% (上限 RM 1000.00)
+    "stamp_duty_unit": 1.50,           # 每 RM 1,000 计 RM 1.50 印花税 (上限 RM 1000.00)
+}
 ```
 
-#### 步骤 3：配置 GitHub Actions 工作流
-在项目根目录下创建目录 `.github/workflows/` 并写入文件 `daily_trade.yml`：
+---
 
-```yaml
-name: KLSE Daily AI Paper Trading
+### 三、 模块设计与职责
 
-on:
-  schedule:
-    # 每周一至周五 马股收盘后运行 (17:30 MYT = 09:30 UTC)
-    - cron: '30 9 * * 1-5'
-  workflow_dispatch:
+#### 1. 模块 A：数据获取 (`investor_agent/data/`)
+- `market.py`: 抓取 KLSE 核心成分股日 K 线，计算 20日均线、RSI(14)、MACD(12,26,9)、ATR(14)。
+- `macro.py`: 抓取布伦特原油、美股标普500、美元兑马币汇率及大马综指。
 
-jobs:
-  trade:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+#### 2. 模块 B：分析决策 (`investor_agent/agent/`)
+- `prompts.py`: 设定大马资深对冲基金经理 Persona，注入账户状态、宏观快照与技术面指标，输出严格 JSON 决策数组。
+- `decision.py`: 自动处理大模型调用，具备 503 拥塞重试与动态 API 模型探测。
 
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
+#### 3. 模块 C：模拟记账与硬风控 (`investor_agent/ledger/`)
+- `fees.py`: 精准计算马股经纪佣金、SST、结算费和印花税。
+- `engine.py`: 管理 SQLite 账本，并在撮合前强制执行 100 股手数、20% 仓位限额、10% 现金底仓拦截，以及 7% 强制止损执行。
 
-      - name: 配置 Python 环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+#### 4. 模块 D：复盘与归因 (`investor_agent/analytics/`)
+- `attribution.py`: 自动计算相对 `^KLSE` 基准超额收益 (Alpha)、年化夏普比率、最大回撤及最大亏损交易反思。
+- `generate_report.py`: 随时生成高规格 Markdown 绩效复盘报告。
 
-      - name: 安装运行依赖
-        run: |
-          pip install -r requirements.txt
+---
 
-      - name: 执行 AI 交易分析与记账
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
-        run: |
-          python main.py
+### 四、 GitHub Actions 调度工作流
 
-      - name: 保存交易数据库与持仓状态
-        run: |
-          git config --global user.name "KLSE-AI-Bot"
-          git config --global user.email "bot@github.com"
-          if [ -f "klse_paper_trade.db" ]; then
-            git add klse_paper_trade.db
-            if ! git diff --quiet || ! git diff --staged --quiet; then
-              git commit -m "Auto: Update portfolio [$(date +'%Y-%m-%d')]"
-              git pull --rebase origin main || true
-              git push
-            else
-              echo "数据库无变更，跳过提交"
-            fi
-          else
-            echo "未检测到交易数据库文件，跳过提交"
-          fi
-```
-
-#### 步骤 4：环境准备与自检
-1. 创建 Python 虚拟环境并安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. 验证本地语法与导入是否正常：
-   ```bash
-   python -c "import yfinance, pandas, google.genai; print('Dependencies OK')"
-   ```
-3. 提供下一步指引：
-   - 告知用户需要在 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中配置名为 `GEMINI_API_KEY` 的 Secret。
-   - （可选）可在 **Variables** 中配置 `GEMINI_MODEL`（默认为 `gemini-2.5-flash`）。
+文件位置：`.github/workflows/daily_trade.yml`
+- **运行时间**：每周一至周五 17:30 MYT（09:30 UTC）
+- **持久化**：自动将更新后的 SQLite 数据库与量化报告 `performance_report.md` 自动提回仓库。

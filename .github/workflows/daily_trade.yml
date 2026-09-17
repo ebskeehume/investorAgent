@@ -32,20 +32,17 @@ jobs:
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.6-flash' }}
         run: |
           python main.py
+          python generate_report.py
 
-      - name: 保存交易数据库与持仓状态
+      - name: 保存交易数据库与最新绩效报告
         run: |
           git config --global user.name "KLSE-AI-Bot"
           git config --global user.email "bot@github.com"
-          if [ -f "klse_paper_trade.db" ]; then
-            git add klse_paper_trade.db
-            if ! git diff --quiet || ! git diff --staged --quiet; then
-              git commit -m "Auto: Update portfolio [$(date +'%Y-%m-%d')]"
-              git pull --rebase origin main || true
-              git push
-            else
-              echo "数据库无变更，跳过提交"
-            fi
+          git add klse_paper_trade.db performance_report.md || true
+          if ! git diff --quiet || ! git diff --staged --quiet; then
+            git commit -m "Auto: Update portfolio and performance report [$(date +'%Y-%m-%d')]"
+            git pull --rebase origin main || true
+            git push
           else
-            echo "未检测到交易数据库文件，跳过提交"
+            echo "数据库与报告无变更，跳过提交"
           fi

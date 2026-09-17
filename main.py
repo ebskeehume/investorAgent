@@ -1,367 +1,104 @@
+"""
+KLSE AI Agent - 马来西亚股票市场自动化虚拟投资主流程
+包含四层闭环：数据获取 -> 分析决策 -> 模拟记账 -> 复盘归因
+"""
 import datetime
-import json
-import math
 import os
-import sqlite3
-import time
-from typing import Dict, List, Optional
-import pandas as pd
-import yfinance as yf
+import sys
+from typing import Dict
 
-# 1. KLSE 费用计算器
-class KLSEFeeCalculator:
-  @staticmethod
-  def calculate_fees(contract_value: float) -> Dict[str, float]:
-    if contract_value <= 0:
-      return {
-          "brokerage": 0.0,
-          "sst": 0.0,
-          "clearing_fee": 0.0,
-          "stamp_duty": 0.0,
-          "total_fee": 0.0,
-      }
-    # 最低 RM 8.00 或 0.08%
-    brokerage = max(8.00, contract_value * 0.0008)
-    # 经纪佣金服务税 8% SST
-    sst = brokerage * 0.08
-    # 结算费 0.03%（最高 RM 1000.00）
-    clearing_fee = min(1000.00, contract_value * 0.0003)
-    # 印花税：每 RM 1000 计 RM 1.50（最高 RM 1000.00）
-    stamp_duty = min(1000.00, math.ceil(contract_value / 1000.00) * 1.50)
-    total_fee = brokerage + sst + clearing_fee + stamp_duty
-    return {
-        "brokerage": round(brokerage, 2),
-        "sst": round(sst, 2),
-        "clearing_fee": round(clearing_fee, 2),
-        "stamp_duty": round(stamp_duty, 2),
-        "total_fee": round(total_fee, 2),
-    }
+# 兼容 Windows 控制台 UTF-8 输出
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
-# 2. 行情抓取
-class KLSEMarketData:
-  @staticmethod
-  def format_ticker(code: str) -> str:
-    code = code.strip().upper()
-    return code if code.endswith(".KL") else f"{code}.KL"
+from investor_agent.config import CONFIG
+from investor_agent.data.market import KLSEMarketData
+from investor_agent.data.macro import MacroEnvironment
+from investor_agent.ledger.engine import KLSELedgerEngine
+from investor_agent.agent.decision import TradingAgent
+from investor_agent.analytics.attribution import PortfolioAnalytics
 
-  @classmethod
-  def get_batch_market_data(cls, codes: List[str]) -> Dict[str, Dict]:
-    if not codes:
-      return {}
-    formatted = [cls.format_ticker(c) for c in codes]
-    try:
-      data = yf.download(formatted, period="1mo", interval="1d", group_by="ticker", progress=False)
-    except Exception as e:
-      print(f"行情下载异常: {e}")
-      return {}
+def run_daily_pipeline():
+    print("=" * 60)
+    print(f"🚀 启动 KLSE AI Agent 每日交易与投研工作流 [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    print("=" * 60)
 
-    results = {}
-    is_multi = isinstance(data.columns, pd.MultiIndex)
+    # 1. 初始化模拟账本引擎
+    engine = KLSELedgerEngine()
+    
+    # 2. 宏观环境扫描
+    print("\n[Step 1/5] 正在拉取宏观与大宗商品市场快照...")
+    macro_data = MacroEnvironment.get_macro_snapshot()
+    for k, v in macro_data.items():
+        print(f"  - {k} ({v['ticker']}): RM {v['price']} (1D: {v['change_1d_pct']}%)")
 
-    for code in codes:
-      t = cls.format_ticker(code)
-      try:
-        if is_multi:
-          if t not in data.columns.levels[0]:
-            continue
-          sub_df = data[t].dropna(subset=["Close"])
-        else:
-          sub_df = data.dropna(subset=["Close"])
+    # 3. 股票池行情与技术指标获取
+    print("\n[Step 2/5] 正在批量获取马股标的池行情与技术指标 (SMA20, RSI, MACD, ATR)...")
+    market_data = KLSEMarketData.get_batch_market_data(CONFIG["watchlist"])
+    if not market_data:
+        print("⚠️ 今日未能获取有效马股行情数据（可能为公假、休市或数据源异常），跳过交易。")
+        return
 
-        if len(sub_df) < 5:
-          continue
+    price_map = {k: v["price"] for k, v in market_data.items()}
+    print(f"  已成功获取 {len(market_data)} 只成分股行情指标。")
 
-        close_series = sub_df["Close"]
-        latest_close = float(close_series.iloc[-1])
-        sma20 = float(close_series.rolling(20).mean().iloc[-1]) if len(close_series) >= 20 else latest_close
-        change_5d = float((latest_close - close_series.iloc[-5]) / close_series.iloc[-5]) * 100
-        vol = sub_df["Volume"].iloc[-1] if "Volume" in sub_df.columns else 0
-        volume = int(vol) if not pd.isna(vol) else 0
+    # 4. 硬风控防线：扫描全持仓执行 7% 硬止损与 15% 止盈
+    print("\n[Step 3/5] 执行前置硬风控扫描（7% 硬止损 / 15% 目标止盈）...")
+    triggered_orders = engine.scan_and_enforce_stop_loss_take_profit(price_map)
+    if triggered_orders:
+        for order in triggered_orders:
+            print(f"  🚨 风控触发订单: {order}")
+    else:
+        print("  ✅ 全持仓风控指标正常，无标的触发硬止损。")
 
-        results[code] = {
-            "price": round(latest_close, 3),
-            "sma20": round(sma20, 3),
-            "change_5d_pct": round(change_5d, 2),
-            "volume": volume,
-        }
-      except Exception as e:
-        print(f"处理股票 {code} 行情异常: {e}")
-        continue
-    return results
+    # 5. 调用 LLM Core 生成结构化决策
+    print("\n[Step 4/5] 正在调用 Gemini 生成今日投资决策...")
+    account_info = engine.get_account_summary(price_map)
+    
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ 错误: 未配置 GEMINI_API_KEY 环境变量！请在环境变量或 GitHub Secrets 中配置。")
+        sys.exit(1)
 
-# 3. 模拟账本
-class KLSELedgerEngine:
-  def __init__(self, db_path: str = "klse_paper_trade.db", initial_capital: float = 100000.00):
-    self.db_path = db_path
-    self.initial_capital = initial_capital
-    self._init_db()
+    agent = TradingAgent(api_key=api_key)
+    decisions = agent.generate_decisions(account_info, market_data, macro_data)
+    
+    print("\n--- AI 今日决策建议列表 ---")
+    for d in decisions:
+        ticker = d.get("ticker")
+        action = d.get("action")
+        lots = d.get("lots", 0)
+        confidence = d.get("confidence", 0)
+        reasons = d.get("reasons", [])
+        print(f"  [{ticker}] 建议: {action} | 手数: {lots} | 置信度: {confidence}%")
+        for r in reasons:
+            print(f"     * {r}")
 
-  def _get_conn(self) -> sqlite3.Connection:
-    return sqlite3.connect(self.db_path)
-
-  def _init_db(self):
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS account (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            cash REAL NOT NULL,
-            initial_capital REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            ticker TEXT PRIMARY KEY,
-            shares INTEGER NOT NULL,
-            avg_cost REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            action TEXT NOT NULL,
-            lots INTEGER NOT NULL,
-            shares INTEGER NOT NULL,
-            price REAL NOT NULL,
-            contract_val REAL NOT NULL,
-            total_fees REAL NOT NULL,
-            net_amount REAL NOT NULL,
-            reason TEXT
-        )
-      """)
-      cur.execute("""
-        CREATE TABLE IF NOT EXISTS nav_history (
-            date TEXT PRIMARY KEY,
-            cash REAL NOT NULL,
-            portfolio_value REAL NOT NULL,
-            total_equity REAL NOT NULL,
-            daily_return_pct REAL NOT NULL
-        )
-      """)
-      cur.execute("SELECT COUNT(*) FROM account")
-      if cur.fetchone()[0] == 0:
-        now = datetime.datetime.now().isoformat()
-        cur.execute("INSERT INTO account VALUES (1, ?, ?, ?)", (self.initial_capital, self.initial_capital, now))
-      conn.commit()
-
-  def get_account_summary(self) -> Dict:
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash, initial_capital FROM account WHERE id = 1")
-      cash, initial = cur.fetchone()
-      positions = pd.read_sql_query("SELECT * FROM positions", conn)
-      return {
-          "cash": cash,
-          "initial_capital": initial,
-          "positions": positions.to_dict(orient="records"),
-      }
-
-  def execute_order(self, ticker: str, action: str, lots: int, price: float, reason: str = "") -> Dict:
-    action = action.upper()
-    if action not in ["BUY", "SELL"] or lots <= 0 or price <= 0:
-      return {"success": False, "msg": "无效参数"}
-    shares = lots * 100
-    contract_val = shares * price
-    fees = KLSEFeeCalculator.calculate_fees(contract_val)
-    now_str = datetime.date.today().isoformat()
-
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash FROM account WHERE id = 1")
-      cash = cur.fetchone()[0]
-
-      if action == "BUY":
-        total_required = contract_val + fees["total_fee"]
-        if cash < total_required:
-          return {"success": False, "msg": f"资金不足，需 RM {total_required:.2f}，当前可用 RM {cash:.2f}"}
-        new_cash = cash - total_required
-        cur.execute("UPDATE account SET cash = ?, updated_at = ? WHERE id = 1", (new_cash, now_str))
-        cur.execute("SELECT shares, avg_cost FROM positions WHERE ticker = ?", (ticker,))
-        row = cur.fetchone()
-        if row:
-          new_shares = row[0] + shares
-          new_cost = ((row[0] * row[1]) + total_required) / new_shares
-          cur.execute("UPDATE positions SET shares = ?, avg_cost = ?, updated_at = ? WHERE ticker = ?", (new_shares, new_cost, now_str, ticker))
-        else:
-          cur.execute("INSERT INTO positions VALUES (?, ?, ?, ?)", (ticker, shares, total_required / shares, now_str))
-        net_amount = -total_required
-
-      elif action == "SELL":
-        cur.execute("SELECT shares, avg_cost FROM positions WHERE ticker = ?", (ticker,))
-        row = cur.fetchone()
-        if not row or row[0] < shares:
-          return {"success": False, "msg": f"持仓不足，当前持仓 {row[0] if row else 0} 股"}
-        proceeds = contract_val - fees["total_fee"]
-        new_cash = cash + proceeds
-        cur.execute("UPDATE account SET cash = ?, updated_at = ? WHERE id = 1", (new_cash, now_str))
-        remaining = row[0] - shares
-        if remaining == 0:
-          cur.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
-        else:
-          cur.execute("UPDATE positions SET shares = ?, updated_at = ? WHERE ticker = ?", (remaining, now_str, ticker))
-        net_amount = proceeds
-
-      cur.execute("""
-        INSERT INTO trades (date, ticker, action, lots, shares, price, contract_val, total_fees, net_amount, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      """, (now_str, ticker, action, lots, shares, price, contract_val, fees["total_fee"], net_amount, reason))
-      conn.commit()
-
-    return {"success": True, "ticker": ticker, "action": action, "lots": lots}
-
-  def record_daily_snapshot(self, price_map: Dict[str, float]) -> Dict:
-    now_str = datetime.date.today().isoformat()
-    with self._get_conn() as conn:
-      cur = conn.cursor()
-      cur.execute("SELECT cash FROM account WHERE id = 1")
-      cash = cur.fetchone()[0]
-      positions = pd.read_sql_query("SELECT * FROM positions", conn)
-      portfolio_val = sum(row["shares"] * price_map.get(row["ticker"], row["avg_cost"]) for _, row in positions.iterrows()) if not positions.empty else 0.0
-      total_equity = cash + portfolio_val
-
-      cur.execute("SELECT total_equity FROM nav_history ORDER BY date DESC LIMIT 1")
-      prev = cur.fetchone()
-      prev_equity = prev[0] if prev else self.initial_capital
-      daily_return = (((total_equity - prev_equity) / prev_equity) * 100) if prev_equity > 0 else 0.0
-
-      cur.execute("""
-        INSERT OR REPLACE INTO nav_history (date, cash, portfolio_value, total_equity, daily_return_pct)
-        VALUES (?, ?, ?, ?, ?)
-      """, (now_str, round(cash, 2), round(portfolio_val, 2), round(total_equity, 2), round(daily_return, 4)))
-      conn.commit()
-      return {"total_equity": round(total_equity, 2), "cash": round(cash, 2), "daily_return": round(daily_return, 2)}
-
-# 4. Agent 决策入口
-def run_agent_trading():
-  api_key = os.environ.get("GEMINI_API_KEY")
-  if not api_key:
-    import sys
-    print("错误: 未配置 GEMINI_API_KEY 环境变量！请在 GitHub 仓库 Settings -> Secrets 中配置 GEMINI_API_KEY。")
-    sys.exit(1)
-
-  try:
-    from google import genai
-    from google.genai import types
-  except ImportError:
-    print("错误: 请先安装 google-genai 依赖 (pip install google-genai)")
-    return
-
-  preferred_model = os.environ.get("GEMINI_MODEL")
-  candidate_models = [m for m in [preferred_model, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"] if m]
-  # 去重保持顺序
-  seen = set()
-  candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
-  watchlist = ["1155", "1295", "5347", "1023", "5225"]
-  engine = KLSELedgerEngine(db_path="klse_paper_trade.db", initial_capital=100000.0)
-  
-  market_data = KLSEMarketData.get_batch_market_data(watchlist)
-  if not market_data:
-    print("今日未能获取有效行情数据（可能为公假、周末或网络故障），跳过 AI 决策执行。")
-    return
-
-  account_info = engine.get_account_summary()
-
-  system_prompt = f"""
-    你是一名专注马来西亚吉隆坡证券交易所（KLSE）的理智量化与价值投资分析师。
-    当前账户资金状态：
-    - 可用现金：RM {account_info['cash']:.2f}
-    - 当前持仓：{json.dumps(account_info['positions'], ensure_ascii=False)}
-
-    今日市场行情快照：
-    {json.dumps(market_data, ensure_ascii=False)}
-
-    【投资与风控规则】：
-    1. 每次交易单位必须为 1 Lot = 100 股。
-    2. 单只股票总持仓不得超过总资产的 25%。现金储备必须保留不少于 10%。
-    3. 如果没有明显胜率，保持持有（HOLD），不用每天都交易。
-    4. 严格输出合规的 JSON 数组，严禁附带额外文字。
-    格式示例：
-    [
-      {{"ticker": "1155", "action": "BUY", "lots": 5, "reason": "突破20日均线且估值具备吸引力"}},
-      {{"ticker": "5347", "action": "HOLD", "lots": 0, "reason": "短期震荡，维持观望"}}
-    ]
-  """
-
-  client = genai.Client(api_key=api_key)
-  response = None
-  for m in candidate_models:
-    for attempt in range(3):
-      try:
-        response = client.models.generate_content(
-            model=m,
-            contents=system_prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
-        )
-        print(f"成功使用模型: {m}")
-        break
-      except Exception as e:
-        err_msg = str(e)
-        if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-          wait_sec = (attempt + 1) * 3
-          print(f"模型 {m} 临时繁忙，等待 {wait_sec} 秒后重试 (第 {attempt + 1}/3 次)...")
-          time.sleep(wait_sec)
-          continue
-        print(f"模型 {m} 调用异常: {e}")
-        break
-    if response and response.text:
-      break
-
-  # 如果预设模型均失败，自动从 API 动态获取可用模型列表兜底
-  if not response or not response.text:
-    print("预设模型暂不可用，正在动态获取该 API Key 权限下的可用模型列表...")
-    try:
-      available_models = [m.name.replace("models/", "") for m in client.models.list()]
-      print(f"当前支持的模型列表: {available_models}")
-      for m in available_models:
-        if ("flash" in m or "pro" in m) and m not in candidate_models:
-          try:
-            print(f"尝试备选模型: {m}")
-            response = client.models.generate_content(
-                model=m,
-                contents=system_prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
+        # 模拟撮合成交（含 20% 仓位与 10% 现金硬风控校验）
+        if action in ["BUY", "SELL"] and lots > 0 and ticker in market_data:
+            price = market_data[ticker]["price"]
+            combined_reason = " | ".join(reasons)
+            res = engine.execute_order(
+                ticker=ticker,
+                action=action,
+                lots=lots,
+                price=price,
+                reason=combined_reason,
+                confidence=float(confidence)
             )
-            print(f"成功使用模型: {m}")
-            break
-          except Exception as e:
-            print(f"模型 {m} 调用异常: {e}")
-    except Exception as list_err:
-      print(f"获取可用模型列表失败: {list_err}")
+            print(f"     => 撮合结果: {res}")
 
-  if not response or not response.text:
-    print("所有候选模型调用均失败，无法获取 AI 决策输出。")
-    import sys
-    sys.exit(1)
+    # 6. 盘后结算与 NAV 快照记录
+    print("\n[Step 5/5] 盘后清算与资产净值 (NAV) 快照归档...")
+    benchmark_price = macro_data.get("klci_index", {}).get("price")
+    snapshot = engine.record_daily_snapshot(price_map, benchmark_price=benchmark_price)
+    print(f"  清算成功: 总资产 RM {snapshot['total_equity']:,.2f} | 现金 RM {snapshot['cash']:,.2f} | 今日回报 {snapshot['daily_return_pct']}%")
 
-  print("AI 今日决策输出：\n", response.text)
-
-  raw_text = response.text.strip()
-  if raw_text.startswith("```"):
-    raw_text = raw_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-  try:
-    decisions = json.loads(raw_text)
-  except json.JSONDecodeError as e:
-    print(f"解析 AI 决策 JSON 失败: {e}\n原始内容: {response.text}")
-    return
-
-  for dec in decisions:
-    action = dec.get("action", "").upper()
-    ticker = str(dec.get("ticker", ""))
-    lots = int(dec.get("lots", 0))
-    reason = dec.get("reason", "")
-    if action in ["BUY", "SELL"] and lots > 0 and ticker in market_data:
-      price = market_data[ticker]["price"]
-      result = engine.execute_order(ticker, action, lots, price, reason)
-      print(f"执行订单结果 [{ticker}]:", result)
-
-  price_map = {k: v["price"] for k, v in market_data.items()}
-  summary = engine.record_daily_snapshot(price_map)
-  print("\n今日资产清算完毕：", summary)
+    # 7. 打印快速绩效简报
+    analytics = PortfolioAnalytics(engine)
+    perf = analytics.generate_performance_metrics()
+    print(f"  📈 累计超额回报 (Alpha): {perf['alpha_pct']}% | 最大回撤: {perf['max_drawdown_pct']}% | 夏普比率: {perf['sharpe_ratio']}")
+    print("\n✅ 今日自动化投资流程全部执行完毕！")
 
 if __name__ == "__main__":
-  run_agent_trading()
+    run_daily_pipeline()
