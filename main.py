@@ -310,6 +310,28 @@ def run_agent_trading():
     if response and response.text:
       break
 
+  # 如果预设模型均失败，自动从 API 动态获取可用模型列表兜底
+  if not response or not response.text:
+    print("预设模型暂不可用，正在动态获取该 API Key 权限下的可用模型列表...")
+    try:
+      available_models = [m.name.replace("models/", "") for m in client.models.list()]
+      print(f"当前支持的模型列表: {available_models}")
+      for m in available_models:
+        if ("flash" in m or "pro" in m) and m not in candidate_models:
+          try:
+            print(f"尝试备选模型: {m}")
+            response = client.models.generate_content(
+                model=m,
+                contents=system_prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
+            )
+            print(f"成功使用模型: {m}")
+            break
+          except Exception as e:
+            print(f"模型 {m} 调用异常: {e}")
+    except Exception as list_err:
+      print(f"获取可用模型列表失败: {list_err}")
+
   if not response or not response.text:
     print("所有候选模型调用均失败，无法获取 AI 决策输出。")
     import sys
