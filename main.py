@@ -98,6 +98,15 @@ def run_daily_pipeline():
     analytics = PortfolioAnalytics(engine)
     perf = analytics.generate_performance_metrics()
     print(f"  📈 累计超额回报 (Alpha): {perf['alpha_pct']}% | 最大回撤: {perf['max_drawdown_pct']}% | 夏普比率: {perf['sharpe_ratio']}")
+
+    # 8. 自动生成与刷新可视化仪表板
+    try:
+        from generate_dashboard import generate_dashboard_html
+        generate_dashboard_html("dashboard.html")
+        print("  🖥️ 可视化监督仪表板已同步更新至: dashboard.html")
+    except Exception as e:
+        print(f"  ⚠️ 更新仪表板异常: {e}")
+
     print("\n✅ 今日自动化投资流程全部执行完毕！")
 
 if __name__ == "__main__":

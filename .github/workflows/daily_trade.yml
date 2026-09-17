@@ -38,9 +38,9 @@ jobs:
         run: |
           git config --global user.name "KLSE-AI-Bot"
           git config --global user.email "bot@github.com"
-          git add klse_paper_trade.db performance_report.md || true
+          git add klse_paper_trade.db performance_report.md dashboard.html || true
           if ! git diff --quiet || ! git diff --staged --quiet; then
-            git commit -m "Auto: Update portfolio and performance report [$(date +'%Y-%m-%d')]"
+            git commit -m "Auto: Update portfolio, dashboard and report [$(date +'%Y-%m-%d')]"
             git pull --rebase origin main || true
             git push
           else
