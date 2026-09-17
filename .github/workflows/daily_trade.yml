@@ -1,0 +1,47 @@
+name: KLSE Daily AI Paper Trading
+
+on:
+  schedule:
+    # 每周一至周五 马股收盘后运行 (17:30 MYT = 09:30 UTC)
+    - cron: '30 9 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装运行依赖
+        run: |
+          pip install -r requirements.txt
+
+      - name: 执行 AI 交易分析与记账
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+        run: |
+          python main.py
+
+      - name: 保存交易数据库与持仓状态
+        run: |
+          git config --global user.name "KLSE-AI-Bot"
+          git config --global user.email "bot@github.com"
+          git add klse_paper_trade.db
+          if ! git diff --quiet || ! git diff --staged --quiet; then
+            git commit -m "Auto: Update portfolio [$(date +'%Y-%m-%d')]"
+            git pull --rebase origin main || true
+            git push
+          else
+            echo "数据库无变更，跳过提交"
+          fi
