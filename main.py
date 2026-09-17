@@ -238,8 +238,9 @@ class KLSELedgerEngine:
 def run_agent_trading():
   api_key = os.environ.get("GEMINI_API_KEY")
   if not api_key:
-    print("错误: 未配置 GEMINI_API_KEY 环境变量！")
-    return
+    import sys
+    print("错误: 未配置 GEMINI_API_KEY 环境变量！请在 GitHub 仓库 Settings -> Secrets 中配置 GEMINI_API_KEY。")
+    sys.exit(1)
 
   try:
     from google import genai

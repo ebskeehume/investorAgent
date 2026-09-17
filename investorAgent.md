@@ -259,8 +259,9 @@ class KLSELedgerEngine:
 def run_agent_trading():
   api_key = os.environ.get("GEMINI_API_KEY")
   if not api_key:
-    print("错误: 未配置 GEMINI_API_KEY 环境变量！")
-    return
+    import sys
+    print("错误: 未配置 GEMINI_API_KEY 环境变量！请在 GitHub 仓库 Settings -> Secrets 中配置 GEMINI_API_KEY。")
+    sys.exit(1)
 
   try:
     from google import genai
@@ -385,13 +386,17 @@ jobs:
         run: |
           git config --global user.name "KLSE-AI-Bot"
           git config --global user.email "bot@github.com"
-          git add klse_paper_trade.db
-          if ! git diff --quiet || ! git diff --staged --quiet; then
-            git commit -m "Auto: Update portfolio [$(date +'%Y-%m-%d')]"
-            git pull --rebase origin main || true
-            git push
+          if [ -f "klse_paper_trade.db" ]; then
+            git add klse_paper_trade.db
+            if ! git diff --quiet || ! git diff --staged --quiet; then
+              git commit -m "Auto: Update portfolio [$(date +'%Y-%m-%d')]"
+              git pull --rebase origin main || true
+              git push
+            else
+              echo "数据库无变更，跳过提交"
+            fi
           else
-            echo "数据库无变更，跳过提交"
+            echo "未检测到交易数据库文件，跳过提交"
           fi
 ```
 
