@@ -24,6 +24,7 @@ import json
 import math
 import os
 import sqlite3
+import time
 from typing import Dict, List, Optional
 import pandas as pd
 import yfinance as yf
@@ -308,16 +309,26 @@ def run_agent_trading():
   client = genai.Client(api_key=api_key)
   response = None
   for m in candidate_models:
-    try:
-      response = client.models.generate_content(
-          model=m,
-          contents=system_prompt,
-          config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
-      )
-      print(f"成功使用模型: {m}")
+    for attempt in range(3):
+      try:
+        response = client.models.generate_content(
+            model=m,
+            contents=system_prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
+        )
+        print(f"成功使用模型: {m}")
+        break
+      except Exception as e:
+        err_msg = str(e)
+        if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+          wait_sec = (attempt + 1) * 3
+          print(f"模型 {m} 临时繁忙，等待 {wait_sec} 秒后重试 (第 {attempt + 1}/3 次)...")
+          time.sleep(wait_sec)
+          continue
+        print(f"模型 {m} 调用异常: {e}")
+        break
+    if response and response.text:
       break
-    except Exception as e:
-      print(f"模型 {m} 调用异常: {e}")
 
   if not response or not response.text:
     print("所有候选模型调用均失败，无法获取 AI 决策输出。")
